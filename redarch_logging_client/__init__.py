@@ -33,3 +33,18 @@ def log(level, service, message, user_id=None, tenant_id=None, request_id=None, 
         response.raise_for_status()
     except Exception as e:
         print(f"[LOGGING ERROR] {e}")
+
+def log_info(service, message, *, user_id=None, tenant_id=None, request_id=None, context=None):
+    log("INFO", service, message, user_id, tenant_id, request_id, context)
+
+def log_debug(service, message, *, user_id=None, tenant_id=None, request_id=None, context=None):
+    log("DEBUG", service, message, user_id, tenant_id, request_id, context)
+
+def log_warn(service, message, *, user_id=None, tenant_id=None, request_id=None, context=None):
+    log("WARN", service, message, user_id, tenant_id, request_id, context)
+
+def log_error(service, message, *, user_id=None, tenant_id=None, request_id=None, context=None):
+    log("ERROR", service, message, user_id, tenant_id, request_id, context)
+
+def log_fatal(service, message, *, user_id=None, tenant_id=None, request_id=None, context=None):
+    log("FATAL", service, message, user_id, tenant_id, request_id, context)

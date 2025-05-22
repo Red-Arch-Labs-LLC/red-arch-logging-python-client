@@ -21,7 +21,7 @@ export RARCH_LOGGING_API_KEY="your_api_key"
 2. Use the client in your Python code:
 
 ```python
-from redarch_logging_client import log
+from redarch_logging_client import log_debug,log_error,log_info,log_warn, log_fatal
 from dotenv import load_dotenv
 load_dotenv()
 

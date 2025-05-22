@@ -1,6 +1,6 @@
 from .logger import Logger
 from .log_manager import logger_manager
-from .threading import ResilientLogger
+from .threading import ThreadedLogger
 
 # Core logging functions (for flat/simple usage)
 def log(level, service, message, user_id=None, tenant_id=None, request_id=None, context=None):

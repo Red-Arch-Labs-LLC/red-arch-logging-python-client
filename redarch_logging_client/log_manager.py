@@ -14,7 +14,7 @@ class LoggerManager:
         logger_name = logger_name or service
         with self._lock:
             if logger_name not in self._loggers:
-                self._loggers[logger_name] = Logger(service=service, level=self._default_level)
+                self._loggers[logger_name] = Logger(service=service, level=self._default_level, logger_name=logger_name)
             return self._loggers[logger_name]
 
     def set_log_level(self, service: str, logger_name: str = None, level: str = "DEBUG"):

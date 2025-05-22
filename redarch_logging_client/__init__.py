@@ -4,7 +4,7 @@ import time
 import os
 
 LOGGING_URL = os.getenv("RARCH_LOGGING_URL", "http://localhost:8080/log")
-JWT_SECRET = os.getenv("RARCH_JWT_SECRET", "")
+JWT_SECRET = os.getenv("RARCH_LOGGING_API_KEY", "")
 
 def generate_jwt():
     payload = {

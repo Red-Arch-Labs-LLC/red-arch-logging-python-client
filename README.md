@@ -21,56 +21,38 @@ export RARCH_LOGGING_API_KEY="your_api_key"
 2. Use the client in your Python code:
 
 ```python
-from redarch_logging_client import log_debug,log_error,log_info,log_warn, log_fatal
-from dotenv import load_dotenv
-load_dotenv()
+from redarch_logging_client import get_logger, set_log_level
+from redarch_logging_client import LOG_LEVEL_DEBUG, LOG_LEVEL_INFO, LOG_LEVEL_WARN, LOG_LEVEL_ERROR, LOG_LEVEL_FATAL
 
+print("Sending test logs...")
 
-log_info(
-    service="user-service",
-    message="User created successfully.",
-    user_id="user-123",
-    tenant_id="tenant-xyz",
-    request_id="req-456",
-    context={"role": "admin", "source": "signup-form"}
-)
+# Initialize logger
+logger = get_logger(service="test-service", logger_name="test_logger")
 
-log_error(
-    service="billing-service",
-    message="Payment failed: insufficient funds.",
-    user_id="user-456",
-    context={"amount": 99.95, "currency": "USD"}
-)
+# Set log level to DEBUG
+set_log_level(service="test-service", logger_name="test_logger", level=LOG_LEVEL_DEBUG)
 
-log_debug(
-    service="billing-service",
-    message="Attempting to validate promo code.",
-    user_id="user-123",
-    context={"promo_code": "SUMMER2025", "step": "pre-checkout"}
-)
+# Define context for this simulated request
+user_id = "user_123"
+tenant_id = "tenant_abc"
+request_id = "req_456"
+context = {
+    "action": "test_logging",
+    "details": {
+        "step": "demo",
+        "test_case": "full_context"
+    }
+}
 
-log_warn(
-    service="inventory-service",
-    message="Inventory low for SKU: PROD-00123",
-    tenant_id="tenant-789",
-    context={"sku": "PROD-00123", "remaining_stock": 3}
-)
+# Send logs at various levels with context
+logger.info("This is a test log message.", user_id=user_id, tenant_id=tenant_id, request_id=request_id, context=context)
+logger.debug("This is a test debug message.", user_id=user_id, tenant_id=tenant_id, request_id=request_id, context=context)
+logger.warn("This is a test warning message.", user_id=user_id, tenant_id=tenant_id, request_id=request_id, context=context)
+logger.error("This is a test error message.", user_id=user_id, tenant_id=tenant_id, request_id=request_id, context=context)
+logger.fatal("This is a test fatal error.", user_id=user_id, tenant_id=tenant_id, request_id=request_id, context=context)
 
-log_error(
-    service="billing-service",
-    message="Payment failed: insufficient funds.",
-    user_id="user-456",
-    tenant_id="tenant-xyz",
-    request_id="req-998877",
-    context={"amount": 99.95, "currency": "USD"}
-)
+print("Done sending logs..")
 
-log_fatal(
-    service="auth-service",
-    message="JWT verification failed due to corrupted secret key.",
-    request_id="req-12345",
-    context={"token_prefix": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...", "env": "prod"}
-)
 
 
 ```

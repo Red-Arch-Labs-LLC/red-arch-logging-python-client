@@ -7,7 +7,7 @@ import threading
 class LoggerManager:
     def __init__(self):
         self._loggers = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock() 
         self._default_level = os.getenv("RARCH_LOGGING_DEFAULT_LEVEL", "DEBUG").upper()
 
     def get_logger(self, service: str, logger_name: str = None):

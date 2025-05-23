@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import sys
 import threading
 from multiprocessing import Queue, Process, Event
 from queue import Empty
@@ -17,6 +18,16 @@ from redarch_logging_client.log_levels import (
     LOG_LEVEL_FATAL,
     LOG_LEVELS,
 )
+
+import logging
+logging.basicConfig(
+    level=logging.INFO,  # Or INFO, WARN, etc.
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+std_out_logger = logging.getLogger("redarch.logger")
+std_out_logger.setLevel(logging.INFO)
+
 
 LOG_DIR = "./var/log"
 MAX_LOG_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -70,9 +81,20 @@ class LoggerQueueWorker:
         self.buffer = buffer
         self.queue = Queue()
         self.stop_event = Event()
-        self.process = Process(target=self._monitor_worker, daemon=False)
+        self.started_event = Event()
+        self.process = Process(target=self._monitor_worker, daemon=False,args=(self.started_event,self.stop_event))
+        std_out_logger.info("[LoggerQueueWorker] Background process starting...")
         self.process.start()
+        
         self._load_buffer()
+
+    def flush_to_disk(self):
+        while not self.queue.empty():
+            try:
+                self.buffer.write(self.queue.get_nowait())
+            except Empty:
+                break
+
 
     def _generate_jwt(self, sub):
         payload = {
@@ -90,24 +112,27 @@ class LoggerQueueWorker:
     def enqueue(self, log_entry):
         self.queue.put(log_entry)
 
-    def _monitor_worker(self):
-        while not self.stop_event.is_set():
-            worker_proc = Process(target=self._run, daemon=False)
+    def _monitor_worker(self, started_event, stop_event):
+        std_out_logger.info("[LoggerQueueWorker] Background monitor process started.")
+        while not stop_event.is_set() or not started_event.is_set():
+            worker_proc = Process(target=self._run, daemon=False, args=(started_event, stop_event))
             worker_proc.start()
-            print(f"[LoggerQueueWorker] Started log delivery subprocess (PID: {worker_proc.pid})")
+            std_out_logger.info(f"[LoggerQueueWorker] Started log delivery subprocess (PID: {worker_proc.pid})")
             worker_proc.join()
-            if self.stop_event.is_set():
+            if stop_event.is_set():
                 break
-            print("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
+            std_out_logger.info("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
             time.sleep(3)
 
-    def _run(self):
-        signal.signal(signal.SIGTERM, lambda s, f: self.stop_event.set())
-        signal.signal(signal.SIGINT, lambda s, f: self.stop_event.set())
-        print("[LoggerQueueWorker] Background process started.")
+    def _run(self, started_event, stop_event):
+        signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
+        signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
+        std_out_logger.info("[LoggerQueueWorker] Background worker process started.")
+        started_event.set()
         while True:
             try:
-                if self.stop_event.is_set() and self.queue.empty():
+                
+                if stop_event.is_set() and self.queue.empty():
                     break
                 item = self.queue.get(timeout=1)
                 service = item.get("service", "unknown-service")
@@ -121,7 +146,7 @@ class LoggerQueueWorker:
                         res.raise_for_status()
                         break  # success
                     except Exception:
-                        if attempt == 3 and not self.stop_event.is_set():
+                        if attempt == 3 and not stop_event.is_set():
                             self.buffer.write(item)
                         else:
                             time.sleep(min(2 ** attempt, 10))
@@ -129,9 +154,20 @@ class LoggerQueueWorker:
                 continue
 
     def flush_and_stop(self):
-        print("[LoggerQueueWorker] Shutting down and flushing remaining logs...")
+        std_out_logger.info("[LoggerQueueWorker] Initiating shutdown...")
         self.stop_event.set()
-        self.process.join(timeout=10)
+
+        # Wait up to 2 seconds for worker process to finish starting
+        if not self.started_event.wait(timeout=2):
+            std_out_logger.warning("[LoggerQueueWorker] Worker process never fully started. Flushing queue to disk.")
+            self.flush_to_disk()
+            return
+
+        if self.process.is_alive():
+            std_out_logger.info("[LoggerQueueWorker] Waiting for log worker to shut down...")
+            self.process.join(timeout=2)
+        
+
 
 class ThreadedLogger:
     """

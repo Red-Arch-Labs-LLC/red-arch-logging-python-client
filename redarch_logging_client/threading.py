@@ -1,10 +1,8 @@
-# resilient_logger.py
-
 import os
 import time
 import json
 import threading
-from multiprocessing import Queue
+from multiprocessing import Queue, Process, Event
 from queue import Empty
 import jwt
 import requests
@@ -25,15 +23,16 @@ MAX_LOG_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 
 class LogFileBuffer:
     """A thread-safe buffer for log entries, stored in a JSONL file."""
-    def clear(self):
-        with self.lock:
-            if os.path.exists(self.buffer_file):
-                os.remove(self.buffer_file)
     def __init__(self, service_name):
         self.log_dir = os.path.join(LOG_DIR, service_name)
         os.makedirs(self.log_dir, exist_ok=True)
         self.buffer_file = os.path.join(self.log_dir, "buffer.jsonl")
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+
+    def clear(self):
+        with self.lock:
+            if os.path.exists(self.buffer_file):
+                os.remove(self.buffer_file)
 
     def write(self, log_entry):
         with self.lock:
@@ -57,9 +56,7 @@ class LogFileBuffer:
         return [json.loads(line) for line in lines if line.strip()]
 
 _worker_instance = None
-_worker_lock = threading.Lock()
-
-from multiprocessing import Process, Event
+_worker_lock = threading.RLock()
 
 class LoggerQueueWorker:
     """
@@ -67,21 +64,19 @@ class LoggerQueueWorker:
     It uses a separate process to handle the log delivery, ensuring that the main application
     remains responsive.
     """
-    def __init__(self, service, url, jwt_secret, logger_name, buffer: LogFileBuffer):
-        self.service = service
+    def __init__(self, url, jwt_secret, buffer: LogFileBuffer):
         self.url = url
         self.jwt_secret = jwt_secret
-        self.logger_name = logger_name
         self.buffer = buffer
         self.queue = Queue()
-        self.process = Process(target=self._monitor_worker, daemon=False)
         self.stop_event = Event()
+        self.process = Process(target=self._monitor_worker, daemon=False)
         self.process.start()
         self._load_buffer()
 
-    def _generate_jwt(self):
+    def _generate_jwt(self, sub):
         payload = {
-            "sub": self.service,
+            "sub": sub,
             "iat": int(time.time()),
             "exp": int(time.time()) + 3600,
         }
@@ -95,7 +90,6 @@ class LoggerQueueWorker:
     def enqueue(self, log_entry):
         self.queue.put(log_entry)
 
-    """Signal handler to gracefully shut down the worker process."""
     def _monitor_worker(self):
         while not self.stop_event.is_set():
             worker_proc = Process(target=self._run, daemon=False)
@@ -110,17 +104,18 @@ class LoggerQueueWorker:
     def _run(self):
         signal.signal(signal.SIGTERM, lambda s, f: self.stop_event.set())
         signal.signal(signal.SIGINT, lambda s, f: self.stop_event.set())
-        print(f"[LoggerQueueWorker] Background process started for service '{self.service}'")
+        print("[LoggerQueueWorker] Background process started.")
         while True:
             try:
                 if self.stop_event.is_set() and self.queue.empty():
                     break
                 item = self.queue.get(timeout=1)
+                service = item.get("service", "unknown-service")
                 for attempt in range(1, 4):
                     try:
                         headers = {
                             "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self._generate_jwt()}"
+                            "Authorization": f"Bearer {self._generate_jwt(service)}"
                         }
                         res = requests.post(self.url, json=item, headers=headers, timeout=2)
                         res.raise_for_status()
@@ -130,7 +125,6 @@ class LoggerQueueWorker:
                             self.buffer.write(item)
                         else:
                             time.sleep(min(2 ** attempt, 10))
-                
             except Empty:
                 continue
 
@@ -151,10 +145,8 @@ class ThreadedLogger:
                 env_url = os.getenv("RARCH_LOGGING_URL", "http://localhost:8080/log")
                 env_secret = os.getenv("RARCH_LOGGING_API_KEY", "")
                 _worker_instance = LoggerQueueWorker(
-                    service=service,
                     url=env_url,
                     jwt_secret=env_secret,
-                    logger_name=logger_name or service,
                     buffer=LogFileBuffer(service)
                 )
         self.service = service
@@ -180,31 +172,22 @@ class ThreadedLogger:
         self.worker.enqueue(entry)
 
     def debug(self, *args, **kwargs):
-        """
-        Log a message at the DEBUG level."""
         self._log(LOG_LEVEL_DEBUG, *args, **kwargs)
 
     def info(self, *args, **kwargs):
-        """
-        Log a message at the INFO level."""
         self._log(LOG_LEVEL_INFO, *args, **kwargs)
 
     def warn(self, *args, **kwargs):
-        """Log a message at the WARN level."""
         self._log(LOG_LEVEL_WARN, *args, **kwargs)
 
     def error(self, *args, **kwargs):
-        """Log a message at the ERROR level."""
         self._log(LOG_LEVEL_ERROR, *args, **kwargs)
 
     def fatal(self, *args, **kwargs):
-        """Log a message at the FATAL level."""
         self._log(LOG_LEVEL_FATAL, *args, **kwargs)
 
     def stop(self):
-        """Stop the logger and flush any remaining logs."""
         self.worker.flush_and_stop()
 
     def flush(self):
-        """Flush any remaining logs to the server."""
         self.worker.flush_and_stop()

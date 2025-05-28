@@ -49,8 +49,11 @@ class LogFileBuffer:
         with self.lock:
             self._rotate_if_needed()
             with open(self.buffer_file, "a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry) + "\n")
-
+                try:
+                    f.write(json.dumps(log_entry) + "\n")
+                except Exception as e:
+                    std_out_logger.error(f"Failed to write log entry: {e}")
+                    std_out_logger.debug(f"Log entry content: {log_entry}")
     def _rotate_if_needed(self):
         if os.path.exists(self.buffer_file) and os.path.getsize(self.buffer_file) >= MAX_LOG_FILE_SIZE:
             timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")

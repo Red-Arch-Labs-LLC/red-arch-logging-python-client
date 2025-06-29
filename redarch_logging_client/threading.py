@@ -18,19 +18,22 @@ from redarch_logging_client.log_levels import (
     LOG_LEVEL_FATAL,
     LOG_LEVELS,
 )
-
+import shutil
 import logging
+
 logging.basicConfig(
-    level=logging.INFO,  # Or INFO, WARN, etc.
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 std_out_logger = logging.getLogger("redarch.logger")
 std_out_logger.setLevel(logging.INFO)
 
-
 LOG_DIR = "./var/log"
 MAX_LOG_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_RETRIES = 5
+MAX_BACKOFF = 10  # seconds
+
 
 class LogFileBuffer:
     """A thread-safe buffer for log entries, stored in a JSONL file."""
@@ -54,6 +57,7 @@ class LogFileBuffer:
                 except Exception as e:
                     std_out_logger.error(f"Failed to write log entry: {e}")
                     std_out_logger.debug(f"Log entry content: {log_entry}")
+
     def _rotate_if_needed(self):
         if os.path.exists(self.buffer_file) and os.path.getsize(self.buffer_file) >= MAX_LOG_FILE_SIZE:
             timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
@@ -69,15 +73,12 @@ class LogFileBuffer:
             os.remove(self.buffer_file)
         return [json.loads(line) for line in lines if line.strip()]
 
+
 _worker_instance = None
 _worker_lock = threading.RLock()
 
+
 class LoggerQueueWorker:
-    """
-    A class to manage a queue of log entries and send them to a remote server.
-    It uses a separate process to handle the log delivery, ensuring that the main application
-    remains responsive.
-    """
     def __init__(self, url, jwt_secret, buffer: LogFileBuffer):
         self.url = url
         self.jwt_secret = jwt_secret
@@ -85,10 +86,9 @@ class LoggerQueueWorker:
         self.queue = Queue()
         self.stop_event = Event()
         self.started_event = Event()
-        self.process = Process(target=self._monitor_worker, daemon=False,args=(self.started_event,self.stop_event))
+        self.process = Process(target=self._monitor_worker, daemon=False, args=(self.started_event, self.stop_event))
         std_out_logger.info("[LoggerQueueWorker] Background process starting...")
         self.process.start()
-        
         self._load_buffer()
 
     def flush_to_disk(self):
@@ -97,7 +97,6 @@ class LoggerQueueWorker:
                 self.buffer.write(self.queue.get_nowait())
             except Empty:
                 break
-
 
     def _generate_jwt(self, sub):
         payload = {
@@ -109,7 +108,9 @@ class LoggerQueueWorker:
         return token if isinstance(token, str) else token.decode("utf-8")
 
     def _load_buffer(self):
-        for entry in self.buffer.read_all():
+        entries = self.buffer.read_all()
+        std_out_logger.info(f"[LoggerQueueWorker] Reloading {len(entries)} buffered log(s) from disk.")
+        for entry in entries:
             self.queue.put(entry)
 
     def enqueue(self, log_entry):
@@ -124,7 +125,7 @@ class LoggerQueueWorker:
             worker_proc.join()
             if stop_event.is_set():
                 break
-            std_out_logger.info("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
+            std_out_logger.warning("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
             time.sleep(3)
 
     def _run(self, started_event, stop_event):
@@ -134,11 +135,19 @@ class LoggerQueueWorker:
         started_event.set()
         while True:
             try:
-                
                 if stop_event.is_set() and self.queue.empty():
                     break
                 item = self.queue.get(timeout=1)
+
+                # Default retry counter
+                item["retry_count"] = item.get("retry_count", 0)
+
+                if item["retry_count"] >= MAX_RETRIES:
+                    std_out_logger.error(f"[LoggerQueueWorker] Dropping log after {MAX_RETRIES} retries: {item}")
+                    continue
+
                 service = item.get("service", "unknown-service")
+
                 for attempt in range(1, 4):
                     try:
                         headers = {
@@ -146,37 +155,38 @@ class LoggerQueueWorker:
                             "Authorization": f"Bearer {self._generate_jwt(service)}"
                         }
                         res = requests.post(self.url, json=item, headers=headers, timeout=2)
-                        res.raise_for_status()
-                        break  # success
-                    except Exception:
-                        if attempt == 3 and not stop_event.is_set():
-                            self.buffer.write(item)
+                        if res.status_code >= 400:
+                            raise Exception(f"HTTP {res.status_code}: {res.text}")
+
+                        std_out_logger.debug(f"[LoggerQueueWorker] Successfully sent log: {item.get('message')}")
+                        break
+                    except Exception as e:
+                        std_out_logger.warning(f"[LoggerQueueWorker] Attempt {attempt} failed: {e}")
+                        if attempt == 3:
+                            item["retry_count"] += 1
+                            if item["retry_count"] < MAX_RETRIES:
+                                std_out_logger.warning(f"[LoggerQueueWorker] Buffering failed log: {item}")
+                                self.buffer.write(item)
+                            else:
+                                std_out_logger.error(f"[LoggerQueueWorker] Dropping permanently failed log: {item}")
                         else:
-                            time.sleep(min(2 ** attempt, 10))
+                            time.sleep(min(2 ** attempt, MAX_BACKOFF))
             except Empty:
                 continue
 
     def flush_and_stop(self):
         std_out_logger.info("[LoggerQueueWorker] Initiating shutdown...")
         self.stop_event.set()
-
-        # Wait up to 2 seconds for worker process to finish starting
         if not self.started_event.wait(timeout=2):
             std_out_logger.warning("[LoggerQueueWorker] Worker process never fully started. Flushing queue to disk.")
             self.flush_to_disk()
             return
-
         if self.process.is_alive():
             std_out_logger.info("[LoggerQueueWorker] Waiting for log worker to shut down...")
             self.process.join(timeout=2)
-        
 
 
 class ThreadedLogger:
-    """
-    A resilient logger that uses a queue to buffer log entries and send them to a remote server.
-    It handles network failures and other issues gracefully, ensuring that logs are not lost.
-    """
     def __init__(self, service, level=LOG_LEVEL_DEBUG, logger_name=None):
         global _worker_instance
         with _worker_lock:
@@ -195,8 +205,7 @@ class ThreadedLogger:
 
     def _log(self, level, message, user_id=None, tenant_id=None, request_id=None, context=None, client_log_datetime=None):
         if LOG_LEVELS.index(level) < LOG_LEVELS.index(self.level):
-            return  # Skip logs below configured level
-
+            return
         entry = {
             "level": level,
             "service": self.service,
@@ -210,23 +219,10 @@ class ThreadedLogger:
         }
         self.worker.enqueue(entry)
 
-    def debug(self, *args, **kwargs):
-        self._log(LOG_LEVEL_DEBUG, *args, **kwargs)
-
-    def info(self, *args, **kwargs):
-        self._log(LOG_LEVEL_INFO, *args, **kwargs)
-
-    def warn(self, *args, **kwargs):
-        self._log(LOG_LEVEL_WARN, *args, **kwargs)
-
-    def error(self, *args, **kwargs):
-        self._log(LOG_LEVEL_ERROR, *args, **kwargs)
-
-    def fatal(self, *args, **kwargs):
-        self._log(LOG_LEVEL_FATAL, *args, **kwargs)
-
-    def stop(self):
-        self.worker.flush_and_stop()
-
-    def flush(self):
-        self.worker.flush_and_stop()
+    def debug(self, *args, **kwargs): self._log(LOG_LEVEL_DEBUG, *args, **kwargs)
+    def info(self, *args, **kwargs): self._log(LOG_LEVEL_INFO, *args, **kwargs)
+    def warn(self, *args, **kwargs): self._log(LOG_LEVEL_WARN, *args, **kwargs)
+    def error(self, *args, **kwargs): self._log(LOG_LEVEL_ERROR, *args, **kwargs)
+    def fatal(self, *args, **kwargs): self._log(LOG_LEVEL_FATAL, *args, **kwargs)
+    def stop(self): self.worker.flush_and_stop()
+    def flush(self): self.worker.flush_and_stop()

@@ -36,11 +36,12 @@ MAX_BACKOFF = 10  # seconds
 
 
 class LogFileBuffer:
-    """A thread-safe buffer for log entries, stored in a JSONL file."""
+    """A thread-safe log buffer with a separate file per process."""
     def __init__(self, service_name):
         self.log_dir = os.path.join(LOG_DIR, service_name)
         os.makedirs(self.log_dir, exist_ok=True)
-        self.buffer_file = os.path.join(self.log_dir, "buffer.jsonl")
+        self.pid = os.getpid()
+        self.buffer_file = os.path.join(self.log_dir, f"buffer_{self.pid}.jsonl")
         self.lock = threading.RLock()
 
     def clear(self):
@@ -51,17 +52,17 @@ class LogFileBuffer:
     def write(self, log_entry):
         with self.lock:
             self._rotate_if_needed()
-            with open(self.buffer_file, "a", encoding="utf-8") as f:
-                try:
+            try:
+                with open(self.buffer_file, "a", encoding="utf-8") as f:
                     f.write(json.dumps(log_entry) + "\n")
-                except Exception as e:
-                    std_out_logger.error(f"Failed to write log entry: {e}")
-                    std_out_logger.debug(f"Log entry content: {log_entry}")
+            except Exception as e:
+                std_out_logger.error(f"Failed to write log entry: {e}")
+                std_out_logger.debug(f"Log entry content: {log_entry}")
 
     def _rotate_if_needed(self):
         if os.path.exists(self.buffer_file) and os.path.getsize(self.buffer_file) >= MAX_LOG_FILE_SIZE:
             timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            rotated_name = f"buffer_{timestamp}.jsonl"
+            rotated_name = f"buffer_{self.pid}_{timestamp}.jsonl"
             os.rename(self.buffer_file, os.path.join(self.log_dir, rotated_name))
 
     def read_all(self):

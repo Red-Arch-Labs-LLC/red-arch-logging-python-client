@@ -20,7 +20,7 @@ logging.raiseExceptions = False  # never crash app on logging errors
 
 @dataclass
 class LoggerConfig:
-    service: str = "app"
+    service: str = os.getenv("RARCH_LOGGING_SERVICE", "unspecified-service")
     logger_name: str | None = None
     level: int = logging.INFO
     api_url: str = os.getenv("RARCH_LOGGING_URL", "http://localhost:8080/log")

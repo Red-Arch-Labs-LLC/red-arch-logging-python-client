@@ -3,6 +3,7 @@ import time
 import json
 import sys
 import threading
+import atexit
 from multiprocessing import Queue, Process, Event
 from queue import Empty
 import jwt
@@ -18,7 +19,6 @@ from redarch_logging_client.log_levels import (
     LOG_LEVEL_FATAL,
     LOG_LEVELS,
 )
-import shutil
 import logging
 
 logging.basicConfig(
@@ -33,6 +33,7 @@ LOG_DIR = "./var/log"
 MAX_LOG_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 MAX_RETRIES = 5
 MAX_BACKOFF = 10  # seconds
+SENTINEL = {"__stop__": True}
 
 
 class LogFileBuffer:
@@ -87,15 +88,26 @@ class LoggerQueueWorker:
         self.queue = Queue()
         self.stop_event = Event()
         self.started_event = Event()
-        self.process = Process(target=self._monitor_worker, daemon=False, args=(self.started_event, self.stop_event))
+
+        # IMPORTANT: monitor must be non-daemon (it spawns the worker child)
+        self.process = Process(
+            target=self._monitor_worker,
+            daemon=False,
+            args=(self.started_event, self.stop_event)
+        )
         std_out_logger.info("[LoggerQueueWorker] Background process starting...")
         self.process.start()
+
         self._load_buffer()
+        atexit.register(self.flush_and_stop)
 
     def flush_to_disk(self):
-        while not self.queue.empty():
+        while True:
             try:
-                self.buffer.write(self.queue.get_nowait())
+                item = self.queue.get_nowait()
+                if item == SENTINEL:
+                    continue
+                self.buffer.write(item)
             except Empty:
                 break
 
@@ -119,72 +131,105 @@ class LoggerQueueWorker:
 
     def _monitor_worker(self, started_event, stop_event):
         std_out_logger.info("[LoggerQueueWorker] Background monitor process started.")
+        # Keep a single worker process running; restart if it crashes (unless stopping)
         while not stop_event.is_set() or not started_event.is_set():
-            worker_proc = Process(target=self._run, daemon=False, args=(started_event, stop_event))
+            worker_proc = Process(
+                target=self._run,
+                daemon=True,  # worker is safe to be daemon; it won't spawn children
+                args=(started_event, stop_event)
+            )
             worker_proc.start()
             std_out_logger.info(f"[LoggerQueueWorker] Started log delivery subprocess (PID: {worker_proc.pid})")
+
+            # Wait until worker exits
             worker_proc.join()
+
             if stop_event.is_set():
                 break
+
             std_out_logger.warning("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
             time.sleep(3)
 
+    def _deliver_or_buffer(self, item):
+        item["retry_count"] = item.get("retry_count", 0)
+        if item["retry_count"] >= MAX_RETRIES:
+            std_out_logger.error(f"[LoggerQueueWorker] Dropping log after {MAX_RETRIES} retries: {item}")
+            return
+
+        service = item.get("service", "unknown-service")
+        for attempt in range(1, 4):
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._generate_jwt(service)}"
+                }
+                res = requests.post(self.url, json=item, headers=headers, timeout=2)
+                if res.status_code >= 400:
+                    raise Exception(f"HTTP {res.status_code}: {res.text}")
+                std_out_logger.debug(f"[LoggerQueueWorker] Successfully sent log: {item.get('message')}")
+                return
+            except Exception as e:
+                std_out_logger.warning(f"[LoggerQueueWorker] Attempt {attempt} failed: {e}")
+                if attempt == 3:
+                    item["retry_count"] += 1
+                    if item["retry_count"] < MAX_RETRIES:
+                        std_out_logger.warning(f"[LoggerQueueWorker] Buffering failed log: {item}")
+                        self.buffer.write(item)
+                    else:
+                        std_out_logger.error(f"[LoggerQueueWorker] Dropping permanently failed log: {item}")
+                else:
+                    time.sleep(min(2 ** attempt, MAX_BACKOFF))
+
     def _run(self, started_event, stop_event):
+        # Child handles signals by requesting a stop
         signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
         signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
         std_out_logger.info("[LoggerQueueWorker] Background worker process started.")
         started_event.set()
+
         while True:
             try:
-                if stop_event.is_set() and self.queue.empty():
-                    break
-                item = self.queue.get(timeout=1)
-
-                # Default retry counter
-                item["retry_count"] = item.get("retry_count", 0)
-
-                if item["retry_count"] >= MAX_RETRIES:
-                    std_out_logger.error(f"[LoggerQueueWorker] Dropping log after {MAX_RETRIES} retries: {item}")
-                    continue
-
-                service = item.get("service", "unknown-service")
-
-                for attempt in range(1, 4):
-                    try:
-                        headers = {
-                            "Content-Type": "application/json",
-                            "Authorization": f"Bearer {self._generate_jwt(service)}"
-                        }
-                        res = requests.post(self.url, json=item, headers=headers, timeout=2)
-                        if res.status_code >= 400:
-                            raise Exception(f"HTTP {res.status_code}: {res.text}")
-
-                        std_out_logger.debug(f"[LoggerQueueWorker] Successfully sent log: {item.get('message')}")
-                        break
-                    except Exception as e:
-                        std_out_logger.warning(f"[LoggerQueueWorker] Attempt {attempt} failed: {e}")
-                        if attempt == 3:
-                            item["retry_count"] += 1
-                            if item["retry_count"] < MAX_RETRIES:
-                                std_out_logger.warning(f"[LoggerQueueWorker] Buffering failed log: {item}")
-                                self.buffer.write(item)
-                            else:
-                                std_out_logger.error(f"[LoggerQueueWorker] Dropping permanently failed log: {item}")
-                        else:
-                            time.sleep(min(2 ** attempt, MAX_BACKOFF))
+                item = self.queue.get(timeout=0.5)
             except Empty:
+                if stop_event.is_set():
+                    break
                 continue
+
+            if item == SENTINEL:
+                # Drain any remaining items queued before shutdown, then exit
+                while True:
+                    try:
+                        next_item = self.queue.get_nowait()
+                        if next_item != SENTINEL:
+                            self._deliver_or_buffer(next_item)
+                    except Empty:
+                        break
+                break
+
+            self._deliver_or_buffer(item)
 
     def flush_and_stop(self):
         std_out_logger.info("[LoggerQueueWorker] Initiating shutdown...")
         self.stop_event.set()
-        if not self.started_event.wait(timeout=2):
+        # Unblock any queue.get() immediately
+        try:
+            self.queue.put_nowait(SENTINEL)
+        except Exception:
+            pass
+
+        # If worker never started, flush queue to disk and return
+        if not self.started_event.wait(timeout=1.0):
             std_out_logger.warning("[LoggerQueueWorker] Worker process never fully started. Flushing queue to disk.")
             self.flush_to_disk()
             return
+
+        # Join the monitor process; terminate if it doesn't exit quickly
         if self.process.is_alive():
             std_out_logger.info("[LoggerQueueWorker] Waiting for log worker to shut down...")
-            self.process.join(timeout=2)
+            self.process.join(timeout=2.0)
+            if self.process.is_alive():
+                std_out_logger.warning("[LoggerQueueWorker] Forcing monitor process to terminate...")
+                self.process.terminate()
 
 
 class ThreadedLogger:

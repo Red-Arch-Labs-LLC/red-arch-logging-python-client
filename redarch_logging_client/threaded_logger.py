@@ -1,274 +1,317 @@
-import os
-import time
+# threaded_logger.py
+import atexit
 import json
+import logging
+import os
 import sys
 import threading
-import atexit
-from multiprocessing import Queue, Process, Event
-from queue import Empty
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from logging.handlers import QueueHandler, QueueListener
+from queue import SimpleQueue
+
 import jwt
 import requests
-import signal
-from uuid import uuid4
-from datetime import datetime, timezone
-from redarch_logging_client.log_levels import (
-    LOG_LEVEL_DEBUG,
-    LOG_LEVEL_INFO,
-    LOG_LEVEL_WARN,
-    LOG_LEVEL_ERROR,
-    LOG_LEVEL_FATAL,
-    LOG_LEVELS,
-)
-import logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-std_out_logger = logging.getLogger("redarch.logger")
-std_out_logger.setLevel(logging.INFO)
-
-LOG_DIR = "./var/log"
-MAX_LOG_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
-MAX_RETRIES = 5
-MAX_BACKOFF = 10  # seconds
-SENTINEL = {"__stop__": True}
+logging.raiseExceptions = False  # never crash app on logging errors
 
 
-class LogFileBuffer:
-    """A thread-safe log buffer with a separate file per process."""
-    def __init__(self, service_name):
-        self.log_dir = os.path.join(LOG_DIR, service_name)
-        os.makedirs(self.log_dir, exist_ok=True)
-        self.pid = os.getpid()
-        self.buffer_file = os.path.join(self.log_dir, f"buffer_{self.pid}.jsonl")
-        self.lock = threading.RLock()
+# ---------------------------- Config ----------------------------
 
-    def clear(self):
-        with self.lock:
-            if os.path.exists(self.buffer_file):
-                os.remove(self.buffer_file)
-
-    def write(self, log_entry):
-        with self.lock:
-            self._rotate_if_needed()
-            try:
-                with open(self.buffer_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-            except Exception as e:
-                std_out_logger.error(f"Failed to write log entry: {e}")
-                std_out_logger.debug(f"Log entry content: {log_entry}")
-
-    def _rotate_if_needed(self):
-        if os.path.exists(self.buffer_file) and os.path.getsize(self.buffer_file) >= MAX_LOG_FILE_SIZE:
-            timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            rotated_name = f"buffer_{self.pid}_{timestamp}.jsonl"
-            os.rename(self.buffer_file, os.path.join(self.log_dir, rotated_name))
-
-    def read_all(self):
-        if not os.path.exists(self.buffer_file):
-            return []
-        with self.lock:
-            with open(self.buffer_file, "r", encoding="utf-8") as f:
-                lines = f.readlines()
-            os.remove(self.buffer_file)
-        return [json.loads(line) for line in lines if line.strip()]
+@dataclass
+class LoggerConfig:
+    service: str = "app"
+    logger_name: str | None = None
+    level: int = logging.INFO
+    api_url: str = os.getenv("RARCH_LOGGING_URL", "http://localhost:8080/log")
+    jwt_secret: str = os.getenv("RARCH_LOGGING_API_KEY", "")
+    api_timeout: float = 2.0
+    buffer_root: str = "./var/log"
+    stdout: bool = True  # mirror to stdout
 
 
-_worker_instance = None
-_worker_lock = threading.RLock()
+# ----------------------- Single-file buffer ---------------------
 
+class _JsonLineBuffer:
+    """
+    Single JSONL buffer per service:
+      ./var/log/<service>/buffer.jsonl
 
-class LoggerQueueWorker:
-    def __init__(self, url, jwt_secret, buffer: LogFileBuffer):
-        self.url = url
-        self.jwt_secret = jwt_secret
-        self.buffer = buffer
-        self.queue = Queue()
-        self.stop_event = Event()
-        self.started_event = Event()
+    - Writes are atomic on POSIX via O_APPEND write.
+    - On startup, atomically renames buffer.jsonl -> buffer.sending-<ts>.jsonl
+      and drains; failed lines are appended back to buffer.jsonl.
+    """
+    def __init__(self, service: str, root_dir: str):
+        self._dir = os.path.join(root_dir, service)
+        os.makedirs(self._dir, exist_ok=True)
+        self._path = os.path.join(self._dir, "buffer.jsonl")
 
-        # IMPORTANT: monitor must be non-daemon (it spawns the worker child)
-        self.process = Process(
-            target=self._monitor_worker,
-            daemon=False,
-            args=(self.started_event, self.stop_event)
-        )
-        std_out_logger.info("[LoggerQueueWorker] Background process starting...")
-        self.process.start()
+    @property
+    def path(self) -> str:
+        return self._path
 
-        self._load_buffer()
-        atexit.register(self.flush_and_stop)
-
-    def flush_to_disk(self):
-        while True:
-            try:
-                item = self.queue.get_nowait()
-                if item == SENTINEL:
-                    continue
-                self.buffer.write(item)
-            except Empty:
-                break
-
-    def _generate_jwt(self, sub):
-        payload = {
-            "sub": sub,
-            "iat": int(time.time()),
-            "exp": int(time.time()) + 3600,
-        }
-        token = jwt.encode(payload, self.jwt_secret, algorithm="HS256")
-        return token if isinstance(token, str) else token.decode("utf-8")
-
-    def _load_buffer(self):
-        entries = self.buffer.read_all()
-        std_out_logger.info(f"[LoggerQueueWorker] Reloading {len(entries)} buffered log(s) from disk.")
-        for entry in entries:
-            self.queue.put(entry)
-
-    def enqueue(self, log_entry):
-        self.queue.put(log_entry)
-
-    def _monitor_worker(self, started_event, stop_event):
-        std_out_logger.info("[LoggerQueueWorker] Background monitor process started.")
-        # Keep a single worker process running; restart if it crashes (unless stopping)
-        while not stop_event.is_set() or not started_event.is_set():
-            worker_proc = Process(
-                target=self._run,
-                daemon=True,  # worker is safe to be daemon; it won't spawn children
-                args=(started_event, stop_event)
-            )
-            worker_proc.start()
-            std_out_logger.info(f"[LoggerQueueWorker] Started log delivery subprocess (PID: {worker_proc.pid})")
-
-            # Wait until worker exits
-            worker_proc.join()
-
-            if stop_event.is_set():
-                break
-
-            std_out_logger.warning("[LoggerQueueWorker] Worker process exited unexpectedly. Restarting in 3 seconds...")
-            time.sleep(3)
-
-    def _deliver_or_buffer(self, item):
-        item["retry_count"] = item.get("retry_count", 0)
-        if item["retry_count"] >= MAX_RETRIES:
-            std_out_logger.error(f"[LoggerQueueWorker] Dropping log after {MAX_RETRIES} retries: {item}")
-            return
-
-        service = item.get("service", "unknown-service")
-        for attempt in range(1, 4):
-            try:
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self._generate_jwt(service)}"
-                }
-                res = requests.post(self.url, json=item, headers=headers, timeout=2)
-                if res.status_code >= 400:
-                    raise Exception(f"HTTP {res.status_code}: {res.text}")
-                std_out_logger.debug(f"[LoggerQueueWorker] Successfully sent log: {item.get('message')}")
-                return
-            except Exception as e:
-                std_out_logger.warning(f"[LoggerQueueWorker] Attempt {attempt} failed: {e}")
-                if attempt == 3:
-                    item["retry_count"] += 1
-                    if item["retry_count"] < MAX_RETRIES:
-                        std_out_logger.warning(f"[LoggerQueueWorker] Buffering failed log: {item}")
-                        self.buffer.write(item)
-                    else:
-                        std_out_logger.error(f"[LoggerQueueWorker] Dropping permanently failed log: {item}")
-                else:
-                    time.sleep(min(2 ** attempt, MAX_BACKOFF))
-
-    def _run(self, started_event, stop_event):
-        # Child handles signals by requesting a stop
-        signal.signal(signal.SIGTERM, lambda s, f: stop_event.set())
-        signal.signal(signal.SIGINT, lambda s, f: stop_event.set())
-        std_out_logger.info("[LoggerQueueWorker] Background worker process started.")
-        started_event.set()
-
-        while True:
-            try:
-                item = self.queue.get(timeout=0.5)
-            except Empty:
-                if stop_event.is_set():
-                    break
-                continue
-
-            if item == SENTINEL:
-                # Drain any remaining items queued before shutdown, then exit
-                while True:
-                    try:
-                        next_item = self.queue.get_nowait()
-                        if next_item != SENTINEL:
-                            self._deliver_or_buffer(next_item)
-                    except Empty:
-                        break
-                break
-
-            self._deliver_or_buffer(item)
-
-    def flush_and_stop(self):
-        std_out_logger.info("[LoggerQueueWorker] Initiating shutdown...")
-        self.stop_event.set()
-        # Unblock any queue.get() immediately
+    def write(self, obj: dict) -> None:
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        fd = os.open(self._path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
         try:
-            self.queue.put_nowait(SENTINEL)
+            os.write(fd, line.encode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def begin_drain(self) -> str | None:
+        if not os.path.exists(self._path) or os.path.getsize(self._path) == 0:
+            return None
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        sending = os.path.join(self._dir, f"buffer.sending-{ts}.jsonl")
+        try:
+            os.replace(self._path, sending)  # atomic
+            return sending
+        except FileNotFoundError:
+            return None
+
+    def drain_file(self, sending_path: str):
+        with open(sending_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    # skip corrupted line
+                    continue
+        try:
+            os.remove(sending_path)
         except Exception:
             pass
 
-        # If worker never started, flush queue to disk and return
-        if not self.started_event.wait(timeout=1.0):
-            std_out_logger.warning("[LoggerQueueWorker] Worker process never fully started. Flushing queue to disk.")
-            self.flush_to_disk()
-            return
 
-        # Join the monitor process; terminate if it doesn't exit quickly
-        if self.process.is_alive():
-            std_out_logger.info("[LoggerQueueWorker] Waiting for log worker to shut down...")
-            self.process.join(timeout=2.0)
-            if self.process.is_alive():
-                std_out_logger.warning("[LoggerQueueWorker] Forcing monitor process to terminate...")
-                self.process.terminate()
+# ----------------------- API target handler ---------------------
 
+class _APILogHandler(logging.Handler):
+    """
+    Posts JSON logs to API; on any failure, appends to buffer.
+    Keeps your schema: service, logger_name, request_id, context, etc.
+    """
+    def __init__(self, cfg: LoggerConfig, buffer: _JsonLineBuffer):
+        super().__init__(level=cfg.level)
+        self.cfg = cfg
+        self.buffer = buffer
+        self.session = requests.Session()
+
+    def _jwt(self, sub: str) -> str:
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        payload = {"sub": sub or "unknown-service", "iat": now, "exp": now + 3600}
+        token = jwt.encode(payload, self.cfg.jwt_secret, algorithm="HS256")
+        return token if isinstance(token, str) else token.decode("utf-8")
+
+    def _payload_from_record(self, record: logging.LogRecord) -> dict:
+        request_id = getattr(record, "request_id", None) or f"auto-{int(record.created*1000)}"
+        return {
+            "level": record.levelname,
+            "service": getattr(record, "service", None) or self.cfg.service,
+            "logger_name": getattr(record, "logger_name", None) or self.cfg.logger_name or record.name,
+            "message": record.getMessage(),
+            "user_id": getattr(record, "user_id", None),
+            "tenant_id": getattr(record, "tenant_id", None),
+            "request_id": request_id,
+            "context": getattr(record, "context", {}) or {},
+            "client_log_datetime": getattr(record, "client_log_datetime", None)
+                or datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+        }
+
+    def emit(self, record: logging.LogRecord) -> None:
+        payload = self._payload_from_record(record)
+        try:
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._jwt(payload.get('service'))}",
+            }
+            resp = self.session.post(
+                self.cfg.api_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                timeout=self.cfg.api_timeout,
+            )
+            if not (200 <= resp.status_code < 300):
+                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception:
+            # On any failure, persist to buffer
+            try:
+                self.buffer.write(payload)
+            except Exception:
+                # swallow as last resort
+                pass
+
+
+# --------------------- optional stdout mirror -------------------
+
+class _StdoutHandler(logging.StreamHandler):
+    def __init__(self, level: int):
+        super().__init__(stream=sys.stdout)
+        self.setLevel(level)
+        self.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+
+
+# ----------------------------- Singleton ------------------------
 
 class ThreadedLogger:
-    def __init__(self, service, level=LOG_LEVEL_DEBUG, logger_name=None):
-        global _worker_instance
-        with _worker_lock:
-            if _worker_instance is None:
-                env_url = os.getenv("RARCH_LOGGING_URL", "http://localhost:8080/log")
-                env_secret = os.getenv("RARCH_LOGGING_API_KEY", "")
-                _worker_instance = LoggerQueueWorker(
-                    url=env_url,
-                    jwt_secret=env_secret,
-                    buffer=LogFileBuffer(service)
-                )
-        self.service = service
-        self.logger_name = logger_name or service
-        self.level = level
-        self.worker = _worker_instance
+    """
+    Lazy, self-initializing singleton that:
+      - wires root/named loggers to a QueueHandler
+      - runs a QueueListener thread with API + optional stdout handlers
+      - drains a single service buffer file on startup
+      - shuts down cleanly via atexit without hanging the app
+    """
+    _instance = None
+    _create_lock = threading.Lock()
 
-    def _log(self, level, message, user_id=None, tenant_id=None, request_id=None, context=None, client_log_datetime=None):
-        if LOG_LEVELS.index(level) < LOG_LEVELS.index(self.level):
+    def __new__(cls):
+        with cls._create_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._init()
+            return cls._instance
+
+    def _init(self):
+        self._cfg = LoggerConfig()
+        self._pid = None
+        self._queue: SimpleQueue = SimpleQueue()
+        self._listener: QueueListener | None = None
+        self._queue_handler: QueueHandler | None = None
+        self._lock = threading.RLock()
+        self._buffer = _JsonLineBuffer(self._cfg.service, self._cfg.buffer_root)
+
+        self._ensure_started()
+        self._drain_buffer_once()
+        atexit.register(self._stop)
+
+    # ---- lifecycle ----
+
+    def _targets(self):
+        targets = [_APILogHandler(self._cfg, self._buffer)]
+        if self._cfg.stdout:
+            targets.append(_StdoutHandler(self._cfg.level))
+        return targets
+
+    def _ensure_started(self):
+        with self._lock:
+            pid = os.getpid()
+            if self._listener and self._pid == pid:
+                return
+
+            if self._listener:
+                try:
+                    self._listener.stop()
+                except Exception:
+                    pass
+                self._listener = None
+
+            self._listener = QueueListener(self._queue, *self._targets(), respect_handler_level=True)
+            self._listener.start()
+
+            self._queue_handler = QueueHandler(self._queue)
+            self._queue_handler.setLevel(self._cfg.level)
+
+            self._pid = pid
+
+    def _stop(self):
+        with self._lock:
+            if self._listener:
+                try:
+                    self._listener.stop()
+                except Exception:
+                    pass
+                self._listener = None
+
+    def _drain_buffer_once(self):
+        sending = self._buffer.begin_drain()
+        if not sending:
             return
-        entry = {
-            "level": level,
-            "service": self.service,
-            "logger_name": self.logger_name,
-            "message": message,
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "request_id": request_id or str(uuid4()),
-            "context": context or {},
-            "client_log_datetime": client_log_datetime or datetime.now(timezone.utc).isoformat(),
-        }
-        self.worker.enqueue(entry)
+        api_handler = _APILogHandler(self._cfg, self._buffer)
+        for obj in self._buffer.drain_file(sending):
+            # Reuse API handler logic; on failure it re-appends to buffer.jsonl
+            try:
+                # LogRecord to keep the same formatting path (ensures parity)
+                levelname = (obj.get("level") or "INFO").upper()
+                levelno = logging._nameToLevel.get(levelname, logging.INFO)
+                record = logging.LogRecord(
+                    name=(obj.get("logger_name") or self._cfg.logger_name or "buffer"),
+                    level=levelno,
+                    pathname=__file__,
+                    lineno=0,
+                    msg=obj.get("message", ""),
+                    args=(),
+                    exc_info=None,
+                )
+                # Attach original fields
+                record.service = obj.get("service")
+                record.logger_name = obj.get("logger_name")
+                record.user_id = obj.get("user_id")
+                record.tenant_id = obj.get("tenant_id")
+                record.request_id = obj.get("request_id")
+                record.context = obj.get("context")
+                record.client_log_datetime = obj.get("client_log_datetime")
+                api_handler.emit(record)
+            except Exception:
+                try:
+                    self._buffer.write(obj)
+                except Exception:
+                    pass
 
-    def debug(self, *args, **kwargs): self._log(LOG_LEVEL_DEBUG, *args, **kwargs)
-    def info(self, *args, **kwargs): self._log(LOG_LEVEL_INFO, *args, **kwargs)
-    def warn(self, *args, **kwargs): self._log(LOG_LEVEL_WARN, *args, **kwargs)
-    def error(self, *args, **kwargs): self._log(LOG_LEVEL_ERROR, *args, **kwargs)
-    def fatal(self, *args, **kwargs): self._log(LOG_LEVEL_FATAL, *args, **kwargs)
-    def stop(self): self.worker.flush_and_stop()
-    def flush(self): self.worker.flush_and_stop()
+    # ---- public API ----
+
+    def configure(self, *,
+                  service: str | None = None,
+                  logger_name: str | None = None,
+                  level: int | None = None,
+                  api_url: str | None = None,
+                  jwt_secret: str | None = None,
+                  api_timeout: float | None = None,
+                  buffer_root: str | None = None,
+                  stdout: bool | None = None):
+        changed = False
+        if service is not None and service != self._cfg.service:
+            self._cfg.service = service; changed = True
+        if logger_name is not None and logger_name != self._cfg.logger_name:
+            self._cfg.logger_name = logger_name; changed = True
+        if level is not None and level != self._cfg.level:
+            self._cfg.level = level; changed = True
+        if api_url is not None and api_url != self._cfg.api_url:
+            self._cfg.api_url = api_url; changed = True
+        if jwt_secret is not None and jwt_secret != self._cfg.jwt_secret:
+            self._cfg.jwt_secret = jwt_secret; changed = True
+        if api_timeout is not None and api_timeout != self._cfg.api_timeout:
+            self._cfg.api_timeout = api_timeout; changed = True
+        if buffer_root is not None and buffer_root != self._cfg.buffer_root:
+            self._cfg.buffer_root = buffer_root; changed = True
+        if stdout is not None and stdout != self._cfg.stdout:
+            self._cfg.stdout = stdout; changed = True
+
+        if changed:
+            with self._lock:
+                # rebuild buffer + listener with new config
+                self._buffer = _JsonLineBuffer(self._cfg.service, self._cfg.buffer_root)
+                if self._listener:
+                    try:
+                        self._listener.stop()
+                    except Exception:
+                        pass
+                    self._listener = None
+                self._pid = None
+            self._ensure_started()
+            # do not drain here again; only on process start
+
+    def get_logger(self, name: str | None = None) -> logging.Logger:
+        self._ensure_started()
+        logger = logging.getLogger(name)
+        with self._lock:
+            if self._queue_handler and not any(isinstance(h, QueueHandler) for h in logger.handlers):
+                logger.addHandler(self._queue_handler)
+            if logger.level == logging.NOTSET:
+                logger.setLevel(self._cfg.level)
+        return logger
+
+
+# public singleton
+#threaded_logger = ThreadedLogger()
